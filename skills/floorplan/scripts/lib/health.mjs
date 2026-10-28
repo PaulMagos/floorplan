@@ -171,6 +171,10 @@ function findSecrets(src, f, out) {
 const GUARD_NAME = /(^|_)(login|auth|authenticated|authorized?|jwt|token|permission|permissions|perm|role|roles|staff|admin|superuser|owner|scope|scopes|session|api_?key|signature|signed|hmac|device|member|user)(_|$)|_required$|^requires?_|^ensure_|^verify_|^check_(auth|token|user|session|permission|role|api)|protect|^is_?authenticated|^is_?admin/i;
 const NOT_GUARD = /^(route|get|post|put|patch|delete|cached?|limit|limiter|rate_?limit\w*|cross_origin|wraps|staticmethod|classmethod|property|retry|timed|log\w*|swag_from|validate\w*|expects|marshal\w*|doc|json_required|fields?_required|params?_required|body_required|transaction\w*|csrf\w*|exempt)$/i;
 const isGuardName = (name) => !!name && !NOT_GUARD.test(name) && GUARD_NAME.test(snake(name));
+// FastAPI dependencies that hand out a database session, not a signed-in caller (`get_db_session`, `SessionDep`
+// over `get_session`): their names match "session" but they don't check anyone.
+const DB_DEPENDENCY = /(^|_)(db|database|sql\w*|engine|conn|connection|cursor|uow|unit_of_work)(_|$)|^db|session_?(local|maker|factory)|^get_session$/i;
+const isGuardDep = (name) => isGuardName(name) && !DB_DEPENDENCY.test(snake(name));
 // A handler body that inspects the caller itself.
 const INLINE_CHECK = /request\.headers(?:\.get)?\(?\s*\[?\s*['"](authorization|x-api-key|x-[\w-]*(token|key|secret|signature)[\w-]*)['"]|req\.headers(?:\.|\[\s*['"])(authorization|x-api-key)|\b(verify|check|require|validate|authenticate|authorize)_?\w*(auth|token|session|user|key|signature|webhook|hmac|jwt|device|staff|admin|permission|role|request|caller)\w*\s*\(|\bcurrent_user\b|get_jwt_identity|verify_jwt_in_request|compare_digest|abort\(\s*40[13]\b|,\s*40[13]\s*\)?\s*$|status(?:Code)?\s*[:=(]\s*40[13]\b|\.status\(\s*40[13]\s*\)|req\.user\b|req\.session\.user|req\.auth\b|jwt\.verify|jwtVerify|getServerSession|auth\(\)|currentUser\(|getAuth\(|auth\.getUser|getSession\(|verifyIdToken|getToken\(/m;
 const SIGNATURE_CHECK = /hmac|signature|verify_?webhook|construct_?event|x-hub-signature|compare_digest|svix|webhooks?\.verify|jwt\.decode|oidc|id_token|authenticated|verify_\w*(token|request|push)/i;
@@ -185,8 +189,38 @@ function blockAfter(lines, defIdx) {
   return lines.slice(defIdx, end).join('\n');
 }
 
+/** A Python def's parameter list, from its `def` line up to the closing `):` (at most 15 lines). */
+function signatureAt(lines, defIdx) {
+  return lines.slice(defIdx, defIdx + 15).join('\n').split(/\)\s*(->[^:]*)?:\s*$/m)[0];
+}
+
+/** Type names on a signature's parameters (`user: AdminUser` -> AdminUser) and the functions in its Depends()/Security(). */
+function paramTypes(sig) {
+  const params = sig.slice(sig.indexOf('(') + 1);
+  const names = [...params.matchAll(/\b\w+\s*:\s*(?:Annotated\[\s*)?([A-Za-z_][\w.]*)|(?:Depends|Security)\(\s*([\w.]+)/g)].map((m) => (m[1] || m[2]).split('.').pop());
+  return [...new Set(names)];
+}
+
 function pyRoutes(src, f, out) {
   const lines = src.split('\n');
+  // FastAPI reusable dependencies: `AdminUser = Annotated[Session, Depends(get_admin)]`, usually defined once in a
+  // deps module and imported by routers as a parameter type (`user: AdminUser`). The build decides which of them
+  // check the caller, following chains like `def owned_office(admin: AdminUser)` behind another alias.
+  const depTargets = new Set();
+  for (const m of src.matchAll(/^(\w+)\s*(?::\s*[\w.]+\s*)?=\s*Annotated\[([^\n]*)\]\s*$/gm)) {
+    const d = /(?:Depends|Security)\(\s*([\w.]+)/.exec(m[2]);
+    if (!d) continue;
+    const fn = d[1].split('.').pop();
+    depTargets.add(fn);
+    out.push({ k: 'dep-alias', name: m[1], fn, line: src.slice(0, m.index).split('\n').length });
+  }
+  for (const m of src.matchAll(/(?:Depends|Security)\(\s*([\w.]+)/g)) depTargets.add(m[1].split('.').pop());
+  for (const m of src.matchAll(/^(?:async\s+)?def\s+(\w+)\s*\(/gm)) {
+    if (!depTargets.has(m[1])) continue;
+    const idx = src.slice(0, m.index).split('\n').length - 1;
+    const uses = paramTypes(signatureAt(lines, idx));
+    if (uses.length) out.push({ k: 'dep-fn', name: m[1], uses, line: idx + 1 });
+  }
   // Blueprint / app-wide before_request hooks and router-level dependencies that check the caller.
   const guardedVars = new Map();
   for (const m of src.matchAll(/^@(\w+)\.before_(?:app_)?request\s*\n(?:@.*\n)*\s*def\s+(\w+)/gm)) {
@@ -227,7 +261,7 @@ function pyRoutes(src, f, out) {
       if (d) below.push(d[1].split('.').pop());
     }
     const decoText = lines.slice(i0, defIdx > 0 ? defIdx : i0 + 1).join('\n');
-    const sig = defIdx > 0 ? lines.slice(defIdx, defIdx + 15).join('\n').split(/\)\s*(->[^:]*)?:\s*$/m)[0] : '';
+    const sig = defIdx > 0 ? signatureAt(lines, defIdx) : '';
     const body = defIdx > 0 ? blockAfter(lines, defIdx) : '';
     const rec = { k: 'route', line: r.line, method: r.method };
     const deco = below.find((d) => (isGuardName(d) || localGuards.has(d)) && !/^(route|get|post|put|patch|delete)$/.test(d));
@@ -235,7 +269,7 @@ function pyRoutes(src, f, out) {
     const deps = [...(decoText + '\n' + sig).matchAll(dep)].map((m) => (m[1] || m[2]).split('.').pop());
     if (deco) Object.assign(rec, { guard: deco, via: 'decorator' });
     else if (guardedVars.has(r.var)) Object.assign(rec, { guard: guardedVars.get(r.var), via: 'blueprint' });
-    else if (deps.some(isGuardName)) Object.assign(rec, { guard: deps.find(isGuardName), via: 'dependency' });
+    else if (deps.some(isGuardDep)) Object.assign(rec, { guard: deps.find(isGuardDep), via: 'dependency' });
     else if (INLINE_CHECK.test(body)) Object.assign(rec, { via: 'inline' });
     else {
       const misplaced = above.find((d) => isGuardName(d) && !/^(route|get|post|put|patch|delete)$/.test(d));
@@ -243,6 +277,11 @@ function pyRoutes(src, f, out) {
       // other decorators may be auth wrappers defined in another file; build resolves them
       const other = below.filter((d) => !/^(route|get|post|put|patch|delete|api_route|websocket)$/.test(d));
       if (other.length) rec.decos = other;
+    }
+    // parameter types that may be dependency aliases defined in another file; build resolves them
+    if (!rec.via) {
+      const anns = paramTypes(sig).filter((n) => /^[A-Z]/.test(n));
+      if (anns.length) rec.anns = anns;
     }
     if (SIGNATURE_CHECK.test(body)) rec.signed = true;
     if (defIdx > 0) rec.fn = /def\s+(\w+)/.exec(lines[defIdx])[1];
@@ -453,11 +492,31 @@ export function buildHealth({ graph, scan, arch, root }) {
   const routeFinding = new Map(); // `${file}|${line}|${method}` -> finding
   const globalGuards = new Map(); // repo -> [{framework, name, file}]
   const guardDefs = new Map();    // name -> [{ file, wrapper }]
+  const depAliases = new Map();   // repo -> Map(alias -> dependency function)
+  const depFns = new Map();       // repo -> Map(dependency function -> types and dependencies it takes)
+  const inRepo = (m, repo) => { if (!m.has(repo)) m.set(repo, new Map()); return m.get(repo); };
   for (const f of scan.files) for (const x of findings(f.path)) {
     if (x.k === 'route') routeFinding.set(`${f.path}|${x.line}|${x.method}`, x);
     // app-wide checks count only from the app itself, not from scripts or tests that spin up their own
     if (x.k === 'global-guard' && !TEST_FILE.test(f.path) && !/(^|\/)(scripts?|tools|bin|examples?)\//.test(f.path) && !(fileByPath.has(f.path) && kinds(fileByPath.get(f.path).n).some((k) => NOT_USED_KINDS.has(k)))) { const k = f.repo ?? ''; if (!globalGuards.has(k)) globalGuards.set(k, []); globalGuards.get(k).push({ ...x, file: f.path }); }
+    if (x.k === 'dep-alias' && !TEST_FILE.test(f.path)) inRepo(depAliases, f.repo ?? '').set(x.name, x.fn);
+    if (x.k === 'dep-fn' && !TEST_FILE.test(f.path)) inRepo(depFns, f.repo ?? '').set(x.name, x.uses);
     if (x.k === 'guard-def' && !TEST_FILE.test(f.path)) { if (!guardDefs.has(x.name)) guardDefs.set(x.name, []); guardDefs.get(x.name).push({ file: f.path, wrapper: !!x.wrapper }); }
+  }
+  // FastAPI dependency aliases that check the caller, per repo: the alias or its function is named like a check,
+  // or that function itself takes one (`def owned_office(admin: AdminUser)`). Database sessions never count.
+  const guardAliases = new Map(); // repo -> Set(alias)
+  for (const [repo, aliases] of depAliases) {
+    const fns = depFns.get(repo) || new Map();
+    const guarded = new Set();
+    const takesGuard = (fn) => (fns.get(fn) || []).some((u) => guarded.has(u) || (/^[a-z_]/.test(u) && isGuardDep(u)));
+    for (let pass = 0; pass < 3; pass++) {
+      for (const [alias, fn] of aliases) {
+        if (guarded.has(alias) || DB_DEPENDENCY.test(snake(fn)) || DB_DEPENDENCY.test(snake(alias))) continue;
+        if (isGuardDep(alias) || isGuardDep(fn) || takesGuard(fn)) guarded.add(alias);
+      }
+    }
+    guardAliases.set(repo, guarded);
   }
   // a sign-in check applied where the route's router is mounted: app.use('/admin', requireStaff, adminRouter)
   const mountGuard = new Map((scan.routes || []).filter((r) => r.mountMw?.some(isGuardName)).map((r) => [`${r.file}|${r.line}|${r.method}`, r.mountMw.find(isGuardName)]));
@@ -475,9 +534,11 @@ export function buildHealth({ graph, scan, arch, root }) {
     // an unrecognised decorator that turns out to be an auth wrapper defined elsewhere in the project
     const viaWrapper = !fnd.via && fnd.decos?.find((d) => guardDefs.get(d)?.some((g) => (g.file.split('/')[0] === r.f.split('/')[0])));
     const mounted = !fnd.via && mountGuard.get(`${r.f}|${r.l}|${r.m}`);
-    if (fnd.via || global || viaWrapper || mounted) {
+    // a parameter typed with a dependency alias that checks the caller (`user: AdminUser`)
+    const viaAlias = !fnd.via && fnd.anns?.find((a) => guardAliases.get(repo)?.has(a));
+    if (fnd.via || global || viaWrapper || mounted || viaAlias) {
       pr.guarded++; pr.guardedIn.set(r.f, (pr.guardedIn.get(r.f) || 0) + 1);
-      const name = fnd.guard || viaWrapper || mounted;
+      const name = fnd.guard || viaWrapper || mounted || viaAlias;
       if (name) {
         pr.guardCounts.set(name, (pr.guardCounts.get(name) || 0) + 1);
         if (!pr.fileGuards.has(r.f)) pr.fileGuards.set(r.f, new Map());

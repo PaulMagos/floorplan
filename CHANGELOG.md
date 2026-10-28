@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- **Fewer false Health alarms (FastAPI):** endpoints protected through a reusable dependency type, like `user: AdminUser` where `AdminUser = Annotated[User, Depends(get_admin)]` is defined in another file, are no longer reported as open to anyone. Chains like `Annotated[Office, Depends(owned_office)]`, where `owned_office` itself takes `AdminUser`, count too.
+- **More accurate Health:** a dependency that only hands out a database session (`Depends(get_db_session)`, `SessionDep`) is no longer mistaken for a login check.
+
 ## 0.1.2 (2026-10-27)
 
 - **Floorplan Cloud waitlist:** once a map has been open for two minutes, a corner card asks, once, whether you'd like an email when Floorplan Cloud (shared, synced team maps) launches. Nothing is sent unless you click **Notify me**, and then only your email and "just me" or "with my team". **Use my Claude email** fills in your Claude account's address, and you see it before anything is sent. **Don't ask again**, or `FLOORPLAN_NO_PROMPTS=1`, turns it off. See [Privacy and security](docs/privacy-and-security.md#floorplan-cloud-waitlist).
